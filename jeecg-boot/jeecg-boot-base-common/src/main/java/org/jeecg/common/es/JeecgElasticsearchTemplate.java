@@ -5,11 +5,15 @@ import com.alibaba.fastjson.JSONObject;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang.StringUtils;
 import org.jeecg.common.util.RestUtil;
+import org.jeecg.common.util.oConvertUtils;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
+
+import java.util.*;
 
 /**
  * 关于 ElasticSearch 的一些方法（创建索引、添加数据、查询等）
@@ -19,11 +23,28 @@ import org.springframework.stereotype.Component;
 @Slf4j
 @Component
 public class JeecgElasticsearchTemplate {
-
-    @Value("${jeecg.elasticsearch.cluster-nodes}")
+    /** es服务地址 */
     private String baseUrl;
-
     private final String FORMAT_JSON = "format=json";
+
+    // ElasticSearch 最大可返回条目数
+    public static final int ES_MAX_SIZE = 10000;
+
+    public JeecgElasticsearchTemplate(@Value("${jeecg.elasticsearch.cluster-nodes}") String baseUrl, @Value("${jeecg.elasticsearch.check-enabled}") boolean checkEnabled) {
+        log.debug("JeecgElasticsearchTemplate BaseURL：" + baseUrl);
+        if (StringUtils.isNotEmpty(baseUrl)) {
+            this.baseUrl = baseUrl;
+            // 验证配置的ES地址是否有效
+            if (checkEnabled) {
+                try {
+                    RestUtil.get(this.getBaseUrl().toString());
+                    log.info("ElasticSearch 服务连接成功");
+                } catch (Exception e) {
+                    log.warn("ElasticSearch 服务连接失败，原因：配置未通过。可能是BaseURL未配置或配置有误，也可能是Elasticsearch服务未启动。接下来将会拒绝执行任何方法！");
+                }
+            }
+        }
+    }
 
     public StringBuilder getBaseUrl(String indexName, String typeName) {
         typeName = typeName.trim().toLowerCase();
@@ -87,6 +108,28 @@ public class JeecgElasticsearchTemplate {
     }
 
     /**
+     * 根据ID获取索引数据，未查询到返回null
+     * <p>
+     * 查询地址：GET http://{baseUrl}/{indexName}/{typeName}/{dataId}
+     *
+     * @param indexName 索引名称
+     * @param typeName  type，一个任意字符串，用于分类
+     * @param dataId    数据id
+     * @return
+     */
+    public JSONObject getDataById(String indexName, String typeName, String dataId) {
+        String url = this.getBaseUrl(indexName, typeName).append("/").append(dataId).toString();
+        log.info("url:" + url);
+        JSONObject result = RestUtil.get(url);
+        boolean found = result.getBoolean("found");
+        if (found) {
+            return result.getJSONObject("_source");
+        } else {
+            return null;
+        }
+    }
+
+    /**
      * 创建索引
      * <p>
      * 查询地址：PUT http://{baseUrl}/{indexName}
@@ -133,6 +176,84 @@ public class JeecgElasticsearchTemplate {
     }
 
     /**
+     * 获取索引字段映射（可获取字段类型）
+     * <p>
+     *
+     * @param indexName 索引名称
+     * @param typeName  分类名称
+     * @return
+     */
+    public JSONObject getIndexMapping(String indexName, String typeName) {
+        String url = this.getBaseUrl(indexName, typeName).append("/_mapping?").append(FORMAT_JSON).toString();
+        log.info("getIndexMapping-url:" + url);
+        /*
+         * 参考返回JSON结构：
+         *
+         *{
+         *    // 索引名称
+         *    "[indexName]": {
+         *        "mappings": {
+         *            // 分类名称
+         *            "[typeName]": {
+         *                "properties": {
+         *                    // 字段名
+         *                    "input_number": {
+         *                        // 字段类型
+         *                        "type": "long"
+         *                    },
+         *                    "input_string": {
+         *                        "type": "text",
+         *                        "fields": {
+         *                            "keyword": {
+         *                                "type": "keyword",
+         *                                "ignore_above": 256
+         *                            }
+         *                        }
+         *                    }
+         *                 }
+         *            }
+         *        }
+         *    }
+         * }
+         */
+        try {
+            return RestUtil.get(url);
+        } catch (org.springframework.web.client.HttpClientErrorException e) {
+            String message = e.getMessage();
+            if (message != null && message.contains("404 Not Found")) {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * 获取索引字段映射，返回Java实体类
+     *
+     * @param indexName
+     * @param typeName
+     * @return
+     */
+    public <T> Map<String, T> getIndexMappingFormat(String indexName, String typeName, Class<T> clazz) {
+        JSONObject mapping = this.getIndexMapping(indexName, typeName);
+        Map<String, T> map = new HashMap<>();
+        if (mapping == null) {
+            return map;
+        }
+        // 获取字段属性
+        JSONObject properties = mapping.getJSONObject(indexName)
+                .getJSONObject("mappings")
+                .getJSONObject(typeName)
+                .getJSONObject("properties");
+        // 封装成 java类型
+        for (String key : properties.keySet()) {
+            T entity = properties.getJSONObject(key).toJavaObject(clazz);
+            map.put(key, entity);
+        }
+        return map;
+    }
+
+    /**
      * 保存数据，详见：saveOrUpdate
      */
     public boolean save(String indexName, String typeName, String dataId, JSONObject data) {
@@ -158,7 +279,7 @@ public class JeecgElasticsearchTemplate {
      * @return
      */
     public boolean saveOrUpdate(String indexName, String typeName, String dataId, JSONObject data) {
-        String url = this.getBaseUrl(indexName, typeName).append("/").append(dataId).toString();
+        String url = this.getBaseUrl(indexName, typeName).append("/").append(dataId).append("?refresh=wait_for").toString();
         /* 返回结果（仅供参考）
        "createIndexA2": {
             "result": "created",
@@ -178,18 +299,67 @@ public class JeecgElasticsearchTemplate {
 
         try {
             // 去掉 data 中为空的值
-            for (String key : data.keySet()) {
+            Set<String> keys = data.keySet();
+            List<String> emptyKeys = new ArrayList<>(keys.size());
+            for (String key : keys) {
                 String value = data.getString(key);
-                if (StringUtils.isEmpty(value)) {
-                    data.remove(key);
+                //1、剔除空值
+                if (oConvertUtils.isEmpty(value) || "[]".equals(value)) {
+                    emptyKeys.add(key);
                 }
+                //2、剔除上传控件值(会导致ES同步失败，报异常failed to parse field [ge_pic] of type [text] )
+                if (oConvertUtils.isNotEmpty(value) && value.indexOf("[{")!=-1) {
+                    emptyKeys.add(key);
+                    log.info("-------剔除上传控件字段------------key: "+ key);
+                }
+            }
+            for (String key : emptyKeys) {
+                data.remove(key);
             }
         } catch (Exception e) {
             e.printStackTrace();
         }
+        try {
+            String result = RestUtil.put(url, data).getString("result");
+            return "created".equals(result) || "updated".equals(result);
+        } catch (Exception e) {
+            log.error(e.getMessage() + "\n-- url: " + url + "\n-- data: " + data.toJSONString());
+            //TODO 打印接口返回异常json
+            return false;
+        }
+    }
 
-        String result = RestUtil.put(url, data).getString("result");
-        return "created".equals(result) || "updated".equals(result);
+    /**
+     * 批量保存数据
+     *
+     * @param indexName 索引名称
+     * @param typeName  type，一个任意字符串，用于分类
+     * @param dataList  要存储的数据数组，每行数据必须包含id
+     * @return
+     */
+    public boolean saveBatch(String indexName, String typeName, JSONArray dataList) {
+        String url = this.getBaseUrl().append("/_bulk").append("?refresh=wait_for").toString();
+        StringBuilder bodySB = new StringBuilder();
+        for (int i = 0; i < dataList.size(); i++) {
+            JSONObject data = dataList.getJSONObject(i);
+            String id = data.getString("id");
+            // 该行的操作
+            // {"create": {"_id":"${id}", "_index": "${indexName}", "_type": "${typeName}"}}
+            JSONObject action = new JSONObject();
+            JSONObject actionInfo = new JSONObject();
+            actionInfo.put("_id", id);
+            actionInfo.put("_index", indexName);
+            actionInfo.put("_type", typeName);
+            action.put("create", actionInfo);
+            bodySB.append(action.toJSONString()).append("\n");
+            // 该行的数据
+            data.remove("id");
+            bodySB.append(data.toJSONString()).append("\n");
+        }
+        System.out.println("+-+-+-: bodySB.toString(): " + bodySB.toString());
+        HttpHeaders headers = RestUtil.getHeaderApplicationJson();
+        RestUtil.request(url, HttpMethod.PUT, headers, null, bodySB, JSONObject.class);
+        return true;
     }
 
     /**
@@ -237,17 +407,27 @@ public class JeecgElasticsearchTemplate {
     public JSONObject search(String indexName, String typeName, JSONObject queryObject) {
         String url = this.getBaseUrl(indexName, typeName).append("/_search").toString();
 
-        log.info("search: " + queryObject.toJSONString());
-
-        return RestUtil.post(url, queryObject);
+        log.info("url:" + url + " ,search: " + queryObject.toJSONString());
+        JSONObject res = RestUtil.post(url, queryObject);
+        log.info("url:" + url + " ,return res: \n" + res.toJSONString());
+        return res;
     }
 
     /**
+     * @param _source （源滤波器）指定返回的字段，传null返回所有字段
+     * @param query
+     * @param from    从第几条数据开始
+     * @param size    返回条目数
      * @return { "query": query }
      */
-    public JSONObject buildQuery(JSONObject query) {
+    public JSONObject buildQuery(List<String> _source, JSONObject query, int from, int size) {
         JSONObject json = new JSONObject();
+        if (_source != null) {
+            json.put("_source", _source);
+        }
         json.put("query", query);
+        json.put("from", from);
+        json.put("size", size);
         return json;
     }
 
